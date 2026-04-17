@@ -76,6 +76,21 @@ struct bpf_reg_state {
 #define UPPER_HALF 0xffffFFFF00000000ull
 
 static bool find_witness_aux(u64 a_min, u64 a_max, u32 b_min, u32 b_max, struct tnum tnum, u64 *out)
+__CPROVER_assigns(*out)
+__CPROVER_ensures(
+	__CPROVER_return_value ==>
+		(a_min <= *out && *out <= a_max &&
+		 b_min <= (u32)*out && (u32)*out <= b_max &&
+		 ((*out & ~tnum.mask) == tnum.value))
+)
+__CPROVER_ensures(
+	!__CPROVER_return_value ==>
+		__CPROVER_forall { u64 v;
+			!(a_min <= v && v <= a_max) ||
+			!(b_min <= (u32)v && (u32)v <= b_max) ||
+			!((v & ~tnum.mask) == tnum.value)
+		}
+)
 {
 	/* The 64-bit range [a_min, a_max] may span multiple 32-bit blocks.
 	 * In the first block, tnum may only partially overlap with
@@ -274,13 +289,22 @@ static void check_complete(void)
 	__CPROVER_assert(tnum_contains(tnum, w), "witness in tnum");
 }
 
+static void assume_well_formed(struct bpf_reg_state *reg)
+{
+	__CPROVER_assume(tnum_well_formed(reg->var_off));
+	__CPROVER_assume(reg->umin_value <= reg->umax_value);
+	__CPROVER_assume(reg->smin_value <= reg->smax_value);
+	__CPROVER_assume(reg->u32_min_value <= reg->u32_max_value);
+	__CPROVER_assume(reg->s32_min_value <= reg->s32_max_value);
+}
+
 static void check_fw_sound(void)
 {
 	struct bpf_reg_state reg = mk_reg();
 	u64 v = nondet_u64();
 	u64 w;
 
-	__CPROVER_assume(tnum_well_formed(reg.var_off));
+	assume_well_formed(&reg);
 	__CPROVER_assume(in_all(v, &reg));
 
 	__CPROVER_assert(find_witness(&reg, &w),
@@ -292,7 +316,7 @@ static void check_fw_complete(void)
 	struct bpf_reg_state reg = mk_reg();
 	u64 w;
 
-	__CPROVER_assume(tnum_well_formed(reg.var_off));
+	assume_well_formed(&reg);
 	__CPROVER_assume(find_witness(&reg, &w));
 
 	__CPROVER_assert(in_all(w, &reg),
