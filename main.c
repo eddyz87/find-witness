@@ -56,33 +56,37 @@ static bool tnum_contains(struct tnum t, u64 v)
 
 #define UPPER_HALF 0xffffFFFF00000000ull
 
-/* pre-conditions:
- * - (u32)a_min <= b_min
- * - b_max <= (u32)a_max
- */
-static bool find_witness_aux(u64 a_min, u64 a_max, u32 b_min, u32 b_max,
-			     struct tnum tnum, u64 *out)
+static bool find_witness_aux(u64 a_min, u64 a_max, u32 b_min, u32 b_max, struct tnum tnum, u64 *out)
 {
-	/* key idea: if a_min/a_max describes several 32-bit blocks tnum might not
-	 * intersect with a_min/a_max in all these blocks, but for blocks where
-	 * it intersects the set of u32 values produced by intersection is identical.
-	 * (except for first and last 32-bit blocks).
+	/* The 64-bit range [a_min, a_max] may span multiple 32-bit blocks.
+	 * In the first block, tnum may only partially overlap with
+	 * [b_min, b_max] (due to clamping to a_min).  But for any middle
+	 * block that intersects with tnum, the set of low-32 tnum values
+	 * is identical, so checking one middle block is enough.
 	 */
 	u64 w, tmax;
+	u32 b_lo;
 
 	tmax = tnum.value | tnum.mask;
 	if (tmax < a_min)
 		return false;
 
-	/* check if tnum intersects with b_min/b_max in the first 32-bit block */
-	w = (a_min & UPPER_HALF) | b_min;
+	/* check if tnum intersects with b_min/b_max in the first 32-bit block,
+	 * clamp lower bound to (u32)a_min since lower values would give w < a_min.
+	 */
+	b_lo = max((u32)a_min, b_min);
+	if (b_lo > b_max)
+		goto next_block;
+
+	w = (a_min & UPPER_HALF) | b_lo;
 	if (!tnum_contains(tnum, w))
 		w = tnum_step(tnum, w);
-	if (w <= a_max && b_min <= (u32)w && (u32)w <= b_max) {
+	if (a_min <= w && w <= a_max && b_min <= (u32)w && (u32)w <= b_max) {
 		*out = w;
 		return true;
 	}
 
+next_block:
 	/* true if there are no more 32-bit blocks */
 	if ((a_min & UPPER_HALF) == UPPER_HALF)
 		return false;
@@ -130,8 +134,6 @@ static void check_sound(void)
 	__CPROVER_assume(tnum_well_formed(tnum));
 	__CPROVER_assume(a_min <= a_max);
 	__CPROVER_assume(b_min <= b_max);
-	__CPROVER_assume((u32)a_min <= b_min);
-	__CPROVER_assume(b_max <= (u32)a_max);
 
 	__CPROVER_assume(a_min <= v && v <= a_max);
 	__CPROVER_assume(b_min <= (u32)v && (u32)v <= b_max);
@@ -153,8 +155,6 @@ static void check_complete(void)
 	__CPROVER_assume(tnum_well_formed(tnum));
 	__CPROVER_assume(a_min <= a_max);
 	__CPROVER_assume(b_min <= b_max);
-	__CPROVER_assume((u32)a_min <= b_min);
-	__CPROVER_assume(b_max <= (u32)a_max);
 	__CPROVER_assume(find_witness_aux(a_min, a_max, b_min, b_max, tnum, &w));
 
 	__CPROVER_assert(a_min <= w && w <= a_max, "witness in 64-bit range");
