@@ -2,7 +2,12 @@
 #include <stdbool.h>
 
 typedef uint64_t u64;
+typedef int64_t  s64;
 typedef uint32_t u32;
+typedef int32_t  s32;
+
+#define min(a, b)	((a) < (b) ? (a) : (b))
+#define max(a, b)	((a) > (b) ? (a) : (b))
 
 /* ---------- tnum (from include/linux/tnum.h, kernel/bpf/tnum.c) ---------- */
 
@@ -53,6 +58,20 @@ static bool tnum_contains(struct tnum t, u64 v)
 	return (v & ~t.mask) == t.value;
 }
 
+
+/* ---------- bpf_reg_state (subset from include/linux/bpf_verifier.h) ----- */
+
+struct bpf_reg_state {
+	s64 smin_value;
+	s64 smax_value;
+	u64 umin_value;
+	u64 umax_value;
+	s32 s32_min_value;
+	s32 s32_max_value;
+	u32 u32_min_value;
+	u32 u32_max_value;
+	struct tnum var_off;
+};
 
 #define UPPER_HALF 0xffffFFFF00000000ull
 
@@ -108,16 +127,109 @@ next_block:
 	return false;
 }
 
+static bool find_witness32(u64 a_min, u64 a_max, struct bpf_reg_state *reg, u64 *out)
+{
+	u32 b_umin = reg->u32_min_value;
+	u32 b_umax = reg->u32_max_value;
+	u32 b_smin = (u32)reg->s32_min_value;
+	u32 b_smax = (u32)reg->s32_max_value;
+	u32 lo, hi;
+
+	if (reg->s32_min_value >= 0 || reg->s32_max_value < 0) {
+		lo = max(b_umin, b_smin);
+		hi = min(b_umax, b_smax);
+		if (lo > hi)
+			return false;
+		return find_witness_aux(a_min, a_max, lo, hi, reg->var_off, out);
+	}
+
+	/* s32 range crosses sign boundary:
+	 * two u32 intervals [0, smax] and [smin, U32_MAX]
+	 */
+
+	/* interval 1: [0, smax] intersected with [b_umin, b_umax] */
+	hi = min(b_umax, b_smax);
+	if (b_umin <= hi && find_witness_aux(a_min, a_max, b_umin, hi, reg->var_off, out))
+		return true;
+
+	/* interval 2: [smin, U32_MAX] intersected with [b_umin, b_umax] */
+	lo = max(b_umin, b_smin);
+	if (lo <= b_umax && find_witness_aux(a_min, a_max, lo, b_umax, reg->var_off, out))
+		return true;
+
+	return false;
+}
+
+static bool find_witness(struct bpf_reg_state *reg, u64 *out)
+{
+	u64 umin = reg->umin_value;
+	u64 umax = reg->umax_value;
+	u64 smin = (u64)reg->smin_value;
+	u64 smax = (u64)reg->smax_value;
+	u64 lo, hi;
+
+	if (reg->smin_value >= 0 || reg->smax_value < 0) {
+		/* s64 range does not cross sign boundary:
+		 * single u64 interval [smin, smax]
+		 */
+		lo = max(umin, smin);
+		hi = min(umax, smax);
+		if (lo > hi)
+			return false;
+		return find_witness32(lo, hi, reg, out);
+	}
+
+	/* s64 range crosses sign boundary:
+	 * two u64 intervals [0, smax] and [smin, U64_MAX]
+	 */
+
+	/* interval 1: [0, smax] intersected with [umin, umax] */
+	hi = min(umax, smax);
+	if (umin <= hi && find_witness32(umin, hi, reg, out))
+		return true;
+
+	/* interval 2: [smin, U64_MAX] intersected with [umin, umax] */
+	lo = max(umin, smin);
+	if (lo <= umax && find_witness32(lo, umax, reg, out))
+		return true;
+
+	return false;
+}
+
 /* ---------- CBMC nondet primitives --------------------------------------- */
 
 u64 nondet_u64(void);
+s64 nondet_s64(void);
 u32 nondet_u32(void);
+s32 nondet_s32(void);
 
 /* Well-formedness: value & mask == 0 (no bit both known and unknown) */
 static bool tnum_well_formed(struct tnum t)
 {
 	return (t.value & t.mask) == 0;
 }
+
+static struct bpf_reg_state mk_reg(void)
+{
+	return (struct bpf_reg_state) {
+		.umin_value    = nondet_u64(),
+		.umax_value    = nondet_u64(),
+		.smin_value    = nondet_s64(),
+		.smax_value    = nondet_s64(),
+		.u32_min_value = nondet_u32(),
+		.u32_max_value = nondet_u32(),
+		.s32_min_value = nondet_s32(),
+		.s32_max_value = nondet_s32(),
+		.var_off       = { .value = nondet_u64(), .mask = nondet_u64() },
+	};
+}
+
+#define in_all(v, reg)							\
+	(((reg)->umin_value    <= (u64)(v) && (u64)(v) <= (reg)->umax_value) &&	\
+	 ((reg)->smin_value    <= (s64)(v) && (s64)(v) <= (reg)->smax_value) &&	\
+	 ((reg)->u32_min_value <= (u32)(v) && (u32)(v) <= (reg)->u32_max_value) && \
+	 ((reg)->s32_min_value <= (s32)(v) && (s32)(v) <= (reg)->s32_max_value) && \
+	 tnum_contains((reg)->var_off, (v)))
 
 /* ---------- checks ------------------------------------------------------- */
 
@@ -162,8 +274,35 @@ static void check_complete(void)
 	__CPROVER_assert(tnum_contains(tnum, w), "witness in tnum");
 }
 
+static void check_fw_sound(void)
+{
+	struct bpf_reg_state reg = mk_reg();
+	u64 v = nondet_u64();
+	u64 w;
+
+	__CPROVER_assume(tnum_well_formed(reg.var_off));
+	__CPROVER_assume(in_all(v, &reg));
+
+	__CPROVER_assert(find_witness(&reg, &w),
+			 "find_witness: should find a witness if one exists");
+}
+
+static void check_fw_complete(void)
+{
+	struct bpf_reg_state reg = mk_reg();
+	u64 w;
+
+	__CPROVER_assume(tnum_well_formed(reg.var_off));
+	__CPROVER_assume(find_witness(&reg, &w));
+
+	__CPROVER_assert(in_all(w, &reg),
+			 "find_witness: returned witness must satisfy all bounds");
+}
+
 void main(void)
 {
 	check_sound();
 	check_complete();
+	check_fw_sound();
+	check_fw_complete();
 }
